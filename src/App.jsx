@@ -120,24 +120,19 @@ const TD_HISTORY_SYMBOLS = {
   XAUUSD: "XAU/USD",
 };
 
-// أسعار لحظية من Twelve Data: الذهب فقط الآن (الفوركس انتقل إلى Finnhub الأسرع أدناه).
-// هذا يوفر معظم حصة الـ 800 credit/يوم لصالح ميزة البيانات التاريخية.
-const TD_QUOTE_SYMBOLS = { XAUUSD: "XAU/USD" };
-const GOLD_REFRESH_INTERVAL_MS = 600000; // 10 دقائق — آمن جدًا لرمز واحد فقط
-
-// Finnhub: أسعار فوركس لحظية حقيقية عبر طلب واحد يرجع كل الأزواج دفعة واحدة (forex/rates).
-// الباقة المجانية 60 طلب/دقيقة بدون حد يومي عملي — تسمح بتحديث كل 60 ثانية فعليًا.
-// invert:true يعني السعر = 1 / السعر المرجعي (لأزواج مثل EUR/USD حيث الدولار هو العملة المقابلة).
-const FINNHUB_PAIRS = [
-  { id: "EURUSD", ccy: "EUR", invert: true },
-  { id: "GBPUSD", ccy: "GBP", invert: true },
-  { id: "USDJPY", ccy: "JPY", invert: false },
-  { id: "USDCHF", ccy: "CHF", invert: false },
-  { id: "AUDUSD", ccy: "AUD", invert: true },
-  { id: "USDCAD", ccy: "CAD", invert: false },
-  { id: "NZDUSD", ccy: "NZD", invert: true },
-];
-const FOREX_REFRESH_INTERVAL_MS = 60000; // 60 ثانية
+// أسعار لحظية من Twelve Data: الفوركس السبعة + الذهب (Finnhub تبيّن أنها لا تدعم هذا مجانًا فعليًا).
+// 8 رموز × 96 دورة/يوم (كل 15 دقيقة) = 768 credit — ضمن حد 800 credit/يوم المجاني بأمان.
+const TD_QUOTE_SYMBOLS = {
+  EURUSD: "EUR/USD",
+  GBPUSD: "GBP/USD",
+  USDJPY: "USD/JPY",
+  USDCHF: "USD/CHF",
+  AUDUSD: "AUD/USD",
+  USDCAD: "USD/CAD",
+  NZDUSD: "NZD/USD",
+  XAUUSD: "XAU/USD",
+};
+const TD_QUOTE_REFRESH_INTERVAL_MS = 900000; // 15 دقيقة — الحد الآمن الحقيقي الوحيد للباقة المجانية
 
 // Binance: عملات رقمية عبر API عام مجاني بالكامل بدون أي مفتاح، وبدون حد يومي عملي.
 // لهذا الكريبتو يتحدث كل 60 ثانية فعليًا (سرعة أعلى بكثير من الفوركس على الباقة المجانية).
@@ -154,7 +149,6 @@ const CRYPTO_REFRESH_INTERVAL_MS = 60000; // 60 ثانية
 const LIVE_MANAGED_IDS = new Set([
   ...Object.keys(TD_QUOTE_SYMBOLS),
   ...Object.keys(BINANCE_SYMBOLS),
-  ...FINNHUB_PAIRS.map((p) => p.id),
 ]);
 
 const CATEGORIES = [
@@ -1498,7 +1492,6 @@ export default function App() {
   useEffect(() => { pricesRef.current = prices; }, [prices]);
   const [liveChangeOverride, setLiveChangeOverride] = useState({});
   const [liveStatus, setLiveStatus] = useState({});
-  const forexBaselineRef = useRef({});
   const historicalClosesRef = useRef({});
 
   // يعيد حساب المؤشرات والدخول/وقف الخسارة/الأهداف بحيث ترتكز دائمًا على آخر سعر حي فعلي،
@@ -1585,7 +1578,7 @@ export default function App() {
       }
     }
     fetchLive();
-    const t = setInterval(fetchLive, GOLD_REFRESH_INTERVAL_MS);
+    const t = setInterval(fetchLive, TD_QUOTE_REFRESH_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(t); };
   }, []);
 
@@ -1679,50 +1672,6 @@ export default function App() {
     fetchCrypto();
     const t = setInterval(fetchCrypto, CRYPTO_REFRESH_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(t); };
-  }, []);
-
-  // جلب أسعار الفوركس الحقيقية كل 60 ثانية عبر Finnhub (طلب واحد يرجع كل الأزواج)
-  useEffect(() => {
-    let cancelled = false;
-    async function fetchForex() {
-      try {
-        const res = await fetch("/.netlify/functions/forex-rates");
-        if (!res.ok) { console.warn("Finnhub function error:", res.status); return; }
-        const data = await res.json();
-        if (cancelled) return;
-        const rates = data.quote || data.rates || (data && typeof data === "object" && (data.EUR || data.JPY) ? data : null);
-        if (!rates) { console.warn("Finnhub forex/rates: unexpected response ->", JSON.stringify(data)); return; }
-        const nextPrices = {};
-        const nextStatus = {};
-        FINNHUB_PAIRS.forEach(({ id, ccy, invert }) => {
-          const r = rates[ccy];
-          if (r) {
-            const price = invert ? 1 / r : r;
-            nextPrices[id] = price;
-            nextStatus[id] = true;
-            if (forexBaselineRef.current[id] === undefined) forexBaselineRef.current[id] = price;
-          }
-        });
-        if (Object.keys(nextPrices).length) {
-          setPrices((prev) => ({ ...prev, ...nextPrices }));
-          setLiveStatus((prev) => ({ ...prev, ...nextStatus }));
-          setLiveChangeOverride((prev) => {
-            const next = { ...prev };
-            Object.entries(nextPrices).forEach(([id, price]) => {
-              const base = forexBaselineRef.current[id];
-              if (base) next[id] = ((price - base) / base) * 100;
-            });
-            return next;
-          });
-          Object.entries(nextPrices).forEach(([id, p]) => recomputeSignalWithLivePrice(id, p));
-        }
-      } catch (e) {
-        console.warn("Finnhub fetch failed:", e.message);
-      }
-    }
-    fetchForex();
-    const t2 = setInterval(fetchForex, FOREX_REFRESH_INTERVAL_MS);
-    return () => { cancelled = true; clearInterval(t2); };
   }, []);
 
   const changes = useMemo(() => {
