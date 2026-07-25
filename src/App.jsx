@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { createChart } from "lightweight-charts";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine
@@ -82,6 +83,29 @@ function stdevReturns(arr, n = 20) {
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
   const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length;
   return Math.sqrt(variance);
+}
+
+// يبني شموع OHLC تقريبية من سلسلة أسعار إغلاق فقط (حقيقية أو محاكاة)، لعرضها ورسم تحليل AI فوقها.
+// يُستخدم أطر زمنية يومية تنازلية من اليوم الحالي لضمان محاور زمنية صحيحة في lightweight-charts.
+function synthesizeOHLC(closes) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const n = closes.length;
+  const bars = [];
+  let prevClose = closes[0];
+  for (let i = 0; i < n; i++) {
+    const c = closes[i];
+    const o = i === 0 ? c : prevClose;
+    const wick = Math.max(Math.abs(c - o) * 0.35, Math.abs(c) * 0.0006);
+    bars.push({
+      time: nowSec - (n - 1 - i) * 86400,
+      open: o,
+      high: Math.max(o, c) + wick,
+      low: Math.min(o, c) - wick,
+      close: c,
+    });
+    prevClose = c;
+  }
+  return bars;
 }
 
 /* ============================== الأصول المالية ============================== */
@@ -305,6 +329,7 @@ function computeSignal(model) {
     last, e20L, e50L, e100L, rsiL, atr, bias, confidence, agreeCount, dirRaw,
     entryLow, entryHigh, entryMid, sl, tp1, tp2, tp3, rr, support, resistance,
     tfTable, reasons, risks, invalidation, scenarios, liquiditySweep, newsHighImpactSoon,
+    ohlcBars: synthesizeOHLC(closes),
   };
 }
 
@@ -491,6 +516,61 @@ function TradingViewWidget({ symbol, height = 720 }) {
       style={{ display: "block", border: "none", width: "100%", height: `${height}px` }}
     />
   );
+}
+
+// تشارت مرسوم فيه تحليل الذكاء الاصطناعي مباشرة (خطوط الدخول/وقف الخسارة/الأهداف/الدعم والمقاومة)
+// باستخدام Lightweight Charts (مكتبة مفتوحة المصدر من TradingView نفسها).
+function AIChart({ signal, decimals, live, height = 420 }) {
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (!containerRef.current || !signal?.ohlcBars?.length) return;
+    const chart = createChart(containerRef.current, {
+      width: containerRef.current.clientWidth,
+      height,
+      layout: { background: { color: "#FFFFFF" }, textColor: C.dim, fontFamily: FONT_MONO },
+      grid: { vertLines: { color: C.border }, horzLines: { color: C.border } },
+      timeScale: { borderColor: C.border, timeVisible: false },
+      rightPriceScale: { borderColor: C.border },
+      crosshair: { mode: 0 },
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: C.green, downColor: C.red, borderVisible: false,
+      wickUpColor: C.green, wickDownColor: C.red,
+    });
+    series.setData(signal.ohlcBars);
+
+    const priceLines = [];
+    function addLine(price, color, title, dashed = true) {
+      if (price === undefined || price === null || isNaN(price)) return;
+      priceLines.push(series.createPriceLine({
+        price, color, lineWidth: 2,
+        lineStyle: dashed ? 2 : 0,
+        axisLabelVisible: true, title,
+      }));
+    }
+    addLine(signal.resistance, C.dim, "مقاومة");
+    addLine(signal.support, C.dim, "دعم");
+    if (signal.sl) addLine(signal.sl, C.red, "SL");
+    addLine(signal.tp1, C.green, "TP1");
+    if (signal.tp2) addLine(signal.tp2, C.green, "TP2");
+    if (signal.tp3) addLine(signal.tp3, C.green, "TP3");
+    addLine(signal.entryLow, C.cyan, "دخول", false);
+    if (Math.abs(signal.entryHigh - signal.entryLow) > 1e-9) addLine(signal.entryHigh, C.cyan, "دخول", false);
+
+    chart.timeScale().fitContent();
+
+    const handleResize = () => {
+      if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth });
+    };
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      chart.remove();
+    };
+  }, [signal, height]);
+
+  return <div ref={containerRef} style={{ width: "100%", height }} />;
 }
 
 function Panel({ children, className = "", style = {} }) {
@@ -700,13 +780,41 @@ function TimeframeLadder({ tfTable }) {
 }
 
 /* ============================== صفحة تفاصيل الأصل ============================== */
-function AssetDetail({ model, signal, price, changePct, inWatchlist, toggleWatch, goToPlan, live }) {
+function AssetDetail({ model, signal, price, changePct, inWatchlist, toggleWatch, goToPlan, live, lastUpdated }) {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResult, setAiResult] = useState(null);
+  const [aiDecision, setAiDecision] = useState(null); // "BUY" | "SELL" | "WAIT"
   const [aiError, setAiError] = useState(null);
+  const [nowTick, setNowTick] = useState(Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  function detectDecision(text) {
+    const idx = text.indexOf("القرار النهائي");
+    const section = idx >= 0 ? text.slice(idx, idx + 250) : text;
+    if (/\bSELL\b/i.test(section) || section.includes("بيع")) return "SELL";
+    if (/\bBUY\b/i.test(section) || section.includes("شراء")) return "BUY";
+    return "WAIT";
+  }
+
+  const REFRESH_MS_BY_ID = TD_QUOTE_SYMBOLS[model.id] ? TD_QUOTE_REFRESH_INTERVAL_MS
+    : BINANCE_SYMBOLS[model.id] ? CRYPTO_REFRESH_INTERVAL_MS : null;
+  const secondsSinceUpdate = lastUpdated ? Math.floor((nowTick - lastUpdated) / 1000) : null;
+  const secondsUntilNext = REFRESH_MS_BY_ID && lastUpdated
+    ? Math.max(0, Math.ceil((REFRESH_MS_BY_ID - (nowTick - lastUpdated)) / 1000))
+    : null;
+  function fmtDuration(sec) {
+    if (sec === null) return "—";
+    if (sec < 60) return `${sec} ثانية`;
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return `${m} د ${s} ث`;
+  }
 
   async function runFullAI() {
-    setAiLoading(true); setAiError(null); setAiResult(null);
+    setAiLoading(true); setAiError(null); setAiResult(null); setAiDecision(null);
     try {
       const mtfLines = signal.tfTable.map((tf) => `  - ${tf.label}: ${tf.trend}`).join("\n");
       const stratLines = STRATEGIES.map((s) =>
@@ -761,6 +869,7 @@ ${stratLines}
       const text = (dataResp.content || []).map((b) => b.text || "").join("\n").trim();
       if (!text) throw new Error("empty");
       setAiResult(text);
+      setAiDecision(detectDecision(text));
     } catch (e) {
       setAiError("تعذر الحصول على تحليل الذكاء الاصطناعي حاليًا. تأكد من ضبط OPENROUTER_API_KEY في إعدادات Netlify.");
     } finally {
@@ -778,6 +887,14 @@ ${stratLines}
               <span className="font-extrabold text-2xl" style={{ fontFamily: FONT_MONO, color: C.softWhite }} dir="ltr">{fmtNum(price, model.decimals)}</span>
               <span className="font-semibold text-sm" style={{ color: changePct >= 0 ? C.green : C.red }} dir="ltr">{changePct >= 0 ? "+" : ""}{fmtNum(changePct, 2)}%</span>
             </div>
+            {live && REFRESH_MS_BY_ID && (
+              <div className="text-[11px] mt-1" style={{ color: C.dim }}>
+                آخر تحديث: منذ {fmtDuration(secondsSinceUpdate)} · التحديث القادم خلال: <b style={{ color: C.gold }}>{fmtDuration(secondsUntilNext)}</b>
+              </div>
+            )}
+            {!live && (
+              <div className="text-[11px] mt-1" style={{ color: C.dim }}>بيانات محاكاة — لا يوجد جدول تحديث حي لهذا الأصل</div>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -808,6 +925,21 @@ ${stratLines}
         )}
         <p className="text-[11px] mt-2" style={{ color: C.dim }}>
           التشارت مزوّد مباشرة من TradingView (بيانات وأدوات رسم حقيقية). مستويات الدخول ووقف الخسارة والأهداف والدعم/المقاومة المقترحة من الذكاء الاصطناعي موضحة بالتفصيل أسفل هذا القسم.
+        </p>
+      </Panel>
+
+      <Panel className="p-4 mb-5">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs font-bold" style={{ color: C.goldBright }}>تشارت مرسوم فيه تحليل الذكاء الاصطناعي</span>
+          <span className="text-[11px]" style={{ color: C.dim }}>
+            {live ? "شموع مبنية على بيانات سعرية حقيقية" : "شموع مبنية على بيانات محاكاة (SIMULATED)"}
+          </span>
+        </div>
+        <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+          <AIChart signal={signal} decimals={model.decimals} live={live} height={420} />
+        </div>
+        <p className="text-[11px] mt-2" style={{ color: C.dim }}>
+          الخطوط المرسومة: منطقة الدخول (سماوي)، وقف الخسارة (أحمر)، الأهداف (أخضر)، والدعم/المقاومة (رمادي متقطع) — كلها محسوبة آليًا من تحليل الأصل الحالي. الشموع تقريبية مبنية من أسعار الإغلاق فقط وليست بيانات Open/High/Low حقيقية بالكامل.
         </p>
       </Panel>
 
@@ -890,7 +1022,17 @@ ${stratLines}
         )}
         {aiResult && (
           <>
-            <div className="rounded-xl p-4 text-xs leading-relaxed whitespace-pre-wrap mb-3" style={{ background: C.bgDeep, border: `1px solid ${C.border}`, color: C.softWhite }}>
+            {aiDecision && (
+              <div className="mb-3">
+                <BiasBadge bias={aiDecision} size="lg" />
+              </div>
+            )}
+            <div className="rounded-xl p-4 text-xs leading-relaxed whitespace-pre-wrap mb-3"
+              style={{
+                background: C.bgDeep,
+                border: `2px solid ${aiDecision === "BUY" ? C.green : aiDecision === "SELL" ? C.red : C.border}`,
+                color: C.softWhite,
+              }}>
               {aiResult}
             </div>
             <div className="flex items-center justify-between">
@@ -1492,6 +1634,7 @@ export default function App() {
   useEffect(() => { pricesRef.current = prices; }, [prices]);
   const [liveChangeOverride, setLiveChangeOverride] = useState({});
   const [liveStatus, setLiveStatus] = useState({});
+  const [lastUpdated, setLastUpdated] = useState({});
   const historicalClosesRef = useRef({});
 
   // يعيد حساب المؤشرات والدخول/وقف الخسارة/الأهداف بحيث ترتكز دائمًا على آخر سعر حي فعلي،
@@ -1572,6 +1715,12 @@ export default function App() {
             return merged;
           });
           Object.entries(nextPrices).forEach(([id, p]) => recomputeSignalWithLivePrice(id, p));
+          const now = Date.now();
+          setLastUpdated((prev) => {
+            const next = { ...prev };
+            Object.keys(nextPrices).forEach((id) => { next[id] = now; });
+            return next;
+          });
         }
       } catch (e) {
         console.warn("Twelve Data fetch failed:", e.message);
@@ -1664,6 +1813,12 @@ export default function App() {
           setPrices((prev) => ({ ...prev, ...nextPrices }));
           setLiveChangeOverride((prev) => ({ ...prev, ...nextChanges }));
           setLiveStatus((prev) => ({ ...prev, ...nextStatus }));
+          const now = Date.now();
+          setLastUpdated((prev) => {
+            const next = { ...prev };
+            Object.keys(nextPrices).forEach((id) => { next[id] = now; });
+            return next;
+          });
         }
       } catch (e) {
         console.warn("Binance fetch failed:", e.message);
@@ -1741,7 +1896,7 @@ export default function App() {
           {view === "asset" && (
             <AssetDetail model={selectedModel} signal={signals[selectedModel.id]} price={prices[selectedModel.id]} changePct={changes[selectedModel.id]}
               inWatchlist={watchlist.includes(selectedModel.id)} toggleWatch={() => toggleWatch(selectedModel.id)}
-              goToPlan={() => setView("tradeplan")} live={liveStatus[selectedModel.id]} />
+              goToPlan={() => setView("tradeplan")} live={liveStatus[selectedModel.id]} lastUpdated={lastUpdated[selectedModel.id]} />
           )}
           {view === "scanner" && (
             <Scanner models={models} signals={signals} prices={prices} sortBy={scannerSort} setSortBy={setScannerSort}
