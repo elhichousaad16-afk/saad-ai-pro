@@ -1640,14 +1640,15 @@ export default function App() {
   // يعيد حساب المؤشرات والدخول/وقف الخسارة/الأهداف بحيث ترتكز دائمًا على آخر سعر حي فعلي،
   // مع الاستفادة من البيانات التاريخية الحقيقية المخزّنة لحساب EMA/RSI بدقة.
   function recomputeSignalWithLivePrice(id, livePrice) {
-    const closes = historicalClosesRef.current[id];
-    if (!closes || !livePrice) return;
+    if (!livePrice) return;
     const model = models.find((m) => m.id === id);
     if (!model) return;
-    const combined = [...closes, livePrice];
+    const realCloses = historicalClosesRef.current[id];
+    const baseCloses = realCloses || model.series;
+    const combined = [...baseCloses, livePrice];
     const realModel = { ...model, series: combined, rand: mulberry32(hashStr(model.id)) };
     const newSignal = computeSignal(realModel);
-    newSignal.indicatorsReal = true;
+    newSignal.indicatorsReal = !!realCloses;
     setSignals((prev) => ({ ...prev, [id]: newSignal }));
   }
 
@@ -1678,6 +1679,13 @@ export default function App() {
         setPrices((prev) => ({ ...prev, ...cached.prices }));
         setLiveChangeOverride((prev) => ({ ...prev, ...(cached.changes || {}) }));
         setLiveStatus((prev) => ({ ...prev, ...(cached.status || {}) }));
+        if (cached.ts) {
+          setLastUpdated((prev) => {
+            const next = { ...prev };
+            Object.keys(cached.prices).forEach((id) => { if (!next[id]) next[id] = cached.ts; });
+            return next;
+          });
+        }
       }
     })();
 
@@ -1704,18 +1712,18 @@ export default function App() {
           }
         });
         if (Object.keys(nextPrices).length) {
+          const now = Date.now();
           setPrices((prev) => ({ ...prev, ...nextPrices }));
           setLiveChangeOverride((prev) => {
             const merged = { ...prev, ...nextChanges };
             setLiveStatus((prevStatus) => {
               const mergedStatus = { ...prevStatus, ...nextStatus };
-              saveKey("live-quotes-cache", { prices: nextPrices, changes: merged, status: mergedStatus });
+              saveKey("live-quotes-cache", { prices: nextPrices, changes: merged, status: mergedStatus, ts: now });
               return mergedStatus;
             });
             return merged;
           });
           Object.entries(nextPrices).forEach(([id, p]) => recomputeSignalWithLivePrice(id, p));
-          const now = Date.now();
           setLastUpdated((prev) => {
             const next = { ...prev };
             Object.keys(nextPrices).forEach((id) => { next[id] = now; });
@@ -1813,6 +1821,7 @@ export default function App() {
           setPrices((prev) => ({ ...prev, ...nextPrices }));
           setLiveChangeOverride((prev) => ({ ...prev, ...nextChanges }));
           setLiveStatus((prev) => ({ ...prev, ...nextStatus }));
+          Object.entries(nextPrices).forEach(([id, p]) => recomputeSignalWithLivePrice(id, p));
           const now = Date.now();
           setLastUpdated((prev) => {
             const next = { ...prev };
