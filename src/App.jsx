@@ -1690,8 +1690,8 @@ export default function App() {
         if (!res.ok) { console.warn("Finnhub function error:", res.status); return; }
         const data = await res.json();
         if (cancelled) return;
-        const rates = data.quote || data.rates || null;
-        if (!rates) { console.warn("Finnhub forex/rates: unexpected response", data); return; }
+        const rates = data.quote || data.rates || (data && typeof data === "object" && (data.EUR || data.JPY) ? data : null);
+        if (!rates) { console.warn("Finnhub forex/rates: unexpected response ->", JSON.stringify(data)); return; }
         const nextPrices = {};
         const nextStatus = {};
         FINNHUB_PAIRS.forEach(({ id, ccy, invert }) => {
