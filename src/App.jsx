@@ -104,17 +104,22 @@ function stdevReturns(arr, n = 20) {
 
 // يبني شموع OHLC تقريبية من سلسلة أسعار إغلاق فقط (حقيقية أو محاكاة)، لعرضها ورسم تحليل AI فوقها.
 // يُستخدم أطر زمنية يومية تنازلية من اليوم الحالي لضمان محاور زمنية صحيحة في lightweight-charts.
-function synthesizeOHLC(closes) {
+function synthesizeOHLC(closes, times) {
   const nowSec = Math.floor(Date.now() / 1000);
   const n = closes.length;
+  const hasRealTimes = Array.isArray(times) && times.length === n;
   const bars = [];
   let prevClose = closes[0];
+  let lastTime = -Infinity;
   for (let i = 0; i < n; i++) {
     const c = closes[i];
     const o = i === 0 ? c : prevClose;
     const wick = Math.max(Math.abs(c - o) * 0.35, Math.abs(c) * 0.0006);
+    let t = hasRealTimes ? Math.floor(times[i]) : nowSec - (n - 1 - i) * 86400;
+    if (t <= lastTime) t = lastTime + 1; // lightweight-charts يتطلب طابع زمني تصاعديًا صارمًا
+    lastTime = t;
     bars.push({
-      time: nowSec - (n - 1 - i) * 86400,
+      time: t,
       open: o,
       high: Math.max(o, c) + wick,
       low: Math.min(o, c) - wick,
@@ -347,7 +352,7 @@ function computeSignal(model) {
     last, e20L, e50L, e100L, rsiL, atr, bias, confidence, agreeCount, dirRaw,
     entryLow, entryHigh, entryMid, sl, tp1, tp2, tp3, rr, support, resistance,
     tfTable, reasons, risks, invalidation, scenarios, liquiditySweep, newsHighImpactSoon,
-    ohlcBars: synthesizeOHLC(closes),
+    ohlcBars: synthesizeOHLC(closes, model.seriesTimes),
     realizedVolPct: realizedVol * 100,
   };
 }
@@ -1796,7 +1801,9 @@ export default function App() {
   const [liveStatus, setLiveStatus] = useState({});
   const [lastUpdated, setLastUpdated] = useState({});
   const historicalClosesRef = useRef({});
+  const historicalTimesRef = useRef({});
   const sessionTicksRef = useRef({});
+  const sessionTickTimesRef = useRef({});
 
   // يعيد حساب المؤشرات والدخول/وقف الخسارة/الأهداف بحيث ترتكز دائمًا على آخر سعر حي فعلي،
   // مع الاستفادة من البيانات التاريخية الحقيقية المخزّنة لحساب EMA/RSI بدقة.
@@ -1805,12 +1812,25 @@ export default function App() {
     const model = models.find((m) => m.id === id);
     if (!model) return;
     const realCloses = historicalClosesRef.current[id];
+    const realTimes = historicalTimesRef.current[id];
     const baseCloses = realCloses || model.series;
     if (!sessionTicksRef.current[id]) sessionTicksRef.current[id] = [];
+    if (!sessionTickTimesRef.current[id]) sessionTickTimesRef.current[id] = [];
     sessionTicksRef.current[id].push(livePrice);
+    sessionTickTimesRef.current[id].push(Math.floor(Date.now() / 1000));
     if (sessionTicksRef.current[id].length > 300) sessionTicksRef.current[id].shift();
+    if (sessionTickTimesRef.current[id].length > 300) sessionTickTimesRef.current[id].shift();
     const combined = [...baseCloses, ...sessionTicksRef.current[id]];
-    const realModel = { ...model, series: combined, rand: mulberry32(hashStr(model.id)) };
+    const tickTimes = sessionTickTimesRef.current[id];
+    let baseTimes;
+    if (realTimes) {
+      baseTimes = realTimes;
+    } else {
+      const endAnchor = (tickTimes[0] || Math.floor(Date.now() / 1000)) - 86400;
+      baseTimes = Array.from({ length: baseCloses.length }, (_, i) => endAnchor - (baseCloses.length - 1 - i) * 86400);
+    }
+    const combinedTimes = [...baseTimes, ...tickTimes];
+    const realModel = { ...model, series: combined, seriesTimes: combinedTimes, rand: mulberry32(hashStr(model.id)) };
     const newSignal = computeSignal(realModel);
     newSignal.indicatorsReal = !!realCloses;
     setSignals((prev) => ({ ...prev, [id]: newSignal }));
@@ -1910,13 +1930,19 @@ export default function App() {
     let cancelled = false;
     const HISTORY_TTL_MS = 20 * 60 * 60 * 1000;
 
-    function applyRealHistory(id, closes) {
+    function applyRealHistory(id, closes, times) {
       const model = models.find((m) => m.id === id);
       if (!model || closes.length < 30) return;
       historicalClosesRef.current[id] = closes;
+      historicalTimesRef.current[id] = times;
+      sessionTicksRef.current[id] = [];
+      sessionTickTimesRef.current[id] = [];
       const currentLivePrice = pricesRef.current[id];
       const combined = currentLivePrice ? [...closes, currentLivePrice] : closes;
-      const realModel = { ...model, series: combined, rand: mulberry32(hashStr(model.id)) };
+      const combinedTimes = currentLivePrice && Array.isArray(times)
+        ? [...times, Math.floor(Date.now() / 1000)]
+        : times;
+      const realModel = { ...model, series: combined, seriesTimes: combinedTimes, rand: mulberry32(hashStr(model.id)) };
       const newSignal = computeSignal(realModel);
       newSignal.indicatorsReal = true;
       setSignals((prev) => ({ ...prev, [id]: newSignal }));
@@ -1929,7 +1955,7 @@ export default function App() {
       const cached = await loadKey(cacheKey, null);
       const now = Date.now();
       if (cached && cached.ts && now - cached.ts < HISTORY_TTL_MS && Array.isArray(cached.closes)) {
-        applyRealHistory(id, cached.closes);
+        applyRealHistory(id, cached.closes, cached.times);
         return;
       }
       try {
@@ -1938,10 +1964,15 @@ export default function App() {
         const data = await res.json();
         if (cancelled) return;
         if (data && Array.isArray(data.values)) {
-          const closes = data.values.map((v) => parseFloat(v.close)).reverse();
+          const rows = [...data.values].reverse();
+          const closes = rows.map((v) => parseFloat(v.close));
+          const times = rows.map((v) => {
+            const iso = v.datetime.includes(" ") ? v.datetime.replace(" ", "T") + "Z" : v.datetime + "T00:00:00Z";
+            return Math.floor(Date.parse(iso) / 1000);
+          });
           if (closes.length >= 30) {
-            await saveKey(cacheKey, { ts: now, closes });
-            applyRealHistory(id, closes);
+            await saveKey(cacheKey, { ts: now, closes, times });
+            applyRealHistory(id, closes, times);
           }
         } else {
           console.warn("Twelve Data history error for", sym, data);
