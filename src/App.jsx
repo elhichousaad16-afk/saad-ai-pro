@@ -243,8 +243,9 @@ function computeSignal(model) {
   const r14 = rsi(closes, 14);
   const e20L = e20[e20.length - 1], e50L = e50[e50.length - 1], e100L = e100[e100.length - 1];
   const rsiL = r14[r14.length - 1];
-  const realizedVol = stdevReturns(closes, 14); // تقلب فعلي مبني على حركة السعر الحقيقية الأخيرة
-  const atr = last * realizedVol * 1.4;
+  const volCloses = model.volSeries || closes;
+  const realizedVol = stdevReturns(volCloses, 14); // تقلب فعلي مبني على حركة السعر الحقيقية الأخيرة (من إطار زمني واحد ثابت)
+  const atr = last * realizedVol * 1.1;
 
   // نقاط فرعية (-1..1)
   const htf = clamp(trueBias, -1, 1);
@@ -1735,16 +1736,32 @@ function Settings({ settings, setSettings, resetData }) {
       </Panel>
       <Panel className="p-5 mb-5">
         <div className="text-xs font-bold mb-2" style={{ color: C.goldBright }}>حول جودة البيانات</div>
+        <p className="text-xs leading-relaxed mb-2" style={{ color: C.softWhite }}>
+          أسعار 7 أزواج فوركس + الذهب (Twelve Data) و5 عملات رقمية (Binance) <b style={{ color: C.green }}>حية فعلية</b>. باقي الأصول (مؤشرات، سلع أخرى، فضة) <b style={{ color: C.gold }}>بيانات محاكاة (SIMULATED)</b> لأغراض العرض فقط.
+        </p>
         <p className="text-xs leading-relaxed" style={{ color: C.softWhite }}>
-          جميع الأسعار والتحليلات المعروضة في هذه المنصة هي بيانات <b style={{ color: C.gold }}>محاكاة (SIMULATED)</b> تم توليدها لأغراض العرض والتصميم فقط، وليست بيانات سوق حية أو تاريخية حقيقية.
-          عند ربط المنصة بمزودي بيانات فعليين، يجب تمييز كل مصدر بوضوح: LIVE / DELAYED / HISTORICAL / SIMULATED.
+          مؤشرات الأخبار الاقتصادية، درجة الثقة، ومحرك الاختبار الخلفي (Backtesting) هي <b style={{ color: C.red }}>صيغ حسابية وتقديرية بناها المطوّر</b> لأغراض العرض والتوضيح، وليست نماذج مالية مُختبرة فعليًا على بيانات تاريخية حقيقية أو نتائج تداول موثّقة.
         </p>
       </Panel>
       <Panel className="p-5 mb-5" style={{ borderColor: `${C.red}44` }}>
         <div className="text-xs font-bold mb-2" style={{ color: C.red }}>إخلاء مسؤولية</div>
         <p className="text-xs leading-relaxed" style={{ color: C.softWhite }}>
-          هذه المنصة أداة شخصية لدعم اتخاذ القرار وتعليم التحليل الفني والأساسي، ولا تُعد نصيحة مالية أو استثمارية. جميع الإشارات مبنية على احتمالات وتقديرات، ولا يوجد أي ضمان لتحقيق ربح. التداول ينطوي على مخاطر قد تصل إلى خسارة كامل رأس المال.
+          هذه المنصة أداة شخصية لدعم اتخاذ القرار وتعليم التحليل الفني والأساسي، ولا تُعد نصيحة مالية أو استثمارية. جميع الإشارات مبنية على احتمالات وتقديرات، و<b style={{ color: C.red }}>لا يوجد ولن يوجد أي ضمان لتحقيق ربح مهما كانت دقة البيانات أو التحليل</b>. التداول ينطوي على مخاطر قد تصل إلى خسارة كامل رأس المال.
         </p>
+      </Panel>
+      <Panel className="p-5 mb-5">
+        <div className="text-xs font-bold mb-2" style={{ color: C.goldBright }}>تحديث البيانات التاريخية المخزّنة</div>
+        <p className="text-xs mb-3" style={{ color: C.dim }}>
+          البيانات التاريخية الحقيقية (لحساب EMA/RSI) تُخزَّن محليًا وتتجدد تلقائيًا كل ~20 ساعة. إذا لاحظت قفزة غريبة بالتشارت المرسوم، اضغط الزر لمسح النسخة المخزّنة وجلب بيانات جديدة فورًا.
+        </p>
+        <button
+          onClick={() => {
+            Object.keys(window.localStorage).forEach((k) => { if (k.startsWith("history-")) window.localStorage.removeItem(k); });
+            window.location.reload();
+          }}
+          className="px-4 py-2 rounded-xl text-xs font-bold" style={{ background: C.gold, color: "#FFFFFF" }}>
+          مسح البيانات التاريخية المخزّنة وتحديثها الآن
+        </button>
       </Panel>
       <Panel className="p-5">
         <div className="text-xs font-bold mb-2" style={{ color: C.red }}>إعادة تعيين البيانات</div>
@@ -1830,7 +1847,7 @@ export default function App() {
       baseTimes = Array.from({ length: baseCloses.length }, (_, i) => endAnchor - (baseCloses.length - 1 - i) * 86400);
     }
     const combinedTimes = [...baseTimes, ...tickTimes];
-    const realModel = { ...model, series: combined, seriesTimes: combinedTimes, rand: mulberry32(hashStr(model.id)) };
+    const realModel = { ...model, series: combined, seriesTimes: combinedTimes, volSeries: baseCloses, rand: mulberry32(hashStr(model.id)) };
     const newSignal = computeSignal(realModel);
     newSignal.indicatorsReal = !!realCloses;
     setSignals((prev) => ({ ...prev, [id]: newSignal }));
@@ -1942,7 +1959,7 @@ export default function App() {
       const combinedTimes = currentLivePrice && Array.isArray(times)
         ? [...times, Math.floor(Date.now() / 1000)]
         : times;
-      const realModel = { ...model, series: combined, seriesTimes: combinedTimes, rand: mulberry32(hashStr(model.id)) };
+      const realModel = { ...model, series: combined, seriesTimes: combinedTimes, volSeries: closes, rand: mulberry32(hashStr(model.id)) };
       const newSignal = computeSignal(realModel);
       newSignal.indicatorsReal = true;
       setSignals((prev) => ({ ...prev, [id]: newSignal }));
