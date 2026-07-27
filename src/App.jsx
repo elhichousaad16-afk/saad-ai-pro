@@ -238,7 +238,8 @@ function computeSignal(model) {
   const r14 = rsi(closes, 14);
   const e20L = e20[e20.length - 1], e50L = e50[e50.length - 1], e100L = e100[e100.length - 1];
   const rsiL = r14[r14.length - 1];
-  const atr = last * volPct * 1.3;
+  const realizedVol = stdevReturns(closes, 14); // تقلب فعلي مبني على حركة السعر الحقيقية الأخيرة
+  const atr = last * realizedVol * 1.4;
 
   // نقاط فرعية (-1..1)
   const htf = clamp(trueBias, -1, 1);
@@ -347,6 +348,7 @@ function computeSignal(model) {
     entryLow, entryHigh, entryMid, sl, tp1, tp2, tp3, rr, support, resistance,
     tfTable, reasons, risks, invalidation, scenarios, liquiditySweep, newsHighImpactSoon,
     ohlcBars: synthesizeOHLC(closes),
+    realizedVolPct: realizedVol * 100,
   };
 }
 
@@ -927,7 +929,7 @@ function AssetDetail({ model, signal, price, changePct, inWatchlist, toggleWatch
 مصدر السعر: ${live ? "حي فعلي (LIVE عبر Twelve Data)" : "محاكاة (SIMULATED)"}
 السعر الحالي: ${fmtNum(price, model.decimals)}
 التغير: ${fmtNum(changePct, 2)}%
-التقلب اليومي التقديري: ${fmtNum(model.volPct * 100, 2)}%
+التقلب اليومي التقديري (من بيانات حقيقية): ${fmtNum(signal.realizedVolPct, 2)}%
 
 المؤشرات الفنية:
 - EMA20: ${fmtNum(signal.e20L, model.decimals)} | EMA50: ${fmtNum(signal.e50L, model.decimals)} | EMA100: ${fmtNum(signal.e100L, model.decimals)}
@@ -1629,7 +1631,7 @@ function AIAssistant({ models, signals, prices }) {
     const mtfBearish = s.tfTable.filter((tf) => tf.trend === "هابط").length;
     return [
       `### ${m.id} (${m.nameAr})`,
-      `السعر: ${fmtNum(prices[m.id], m.decimals)} | التقلب: ${fmtNum(m.volPct * 100, 2)}%`,
+      `السعر: ${fmtNum(prices[m.id], m.decimals)} | التقلب: ${fmtNum(s.realizedVolPct, 2)}%`,
       `الانحياز: ${s.bias} | الثقة: ${s.confidence}% | التأكيدات: ${s.agreeCount}/5`,
       `RSI(14): ${fmtNum(s.rsiL, 1)} | ${emaRel}`,
       `المواءمة عبر الأطر الزمنية: ${mtfBullish} صاعد / ${mtfBearish} هابط من أصل ${s.tfTable.length}`,
