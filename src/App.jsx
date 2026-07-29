@@ -379,6 +379,18 @@ const STRATEGIES = [
   { id: "ict_turtle", name: "ICT — Turtle Soup (فخ السيولة والانعكاس)", when: "عند كسر وهمي لقاع أو قمة سابقة (تشبه اختراقًا حقيقيًا) يتبعه رجوع سريع للداخل، ما يشير لفخ سيولة كلاسيكي.", whenNot: "عند استمرار الاختراق دون أي علامة رجوع سريع (يكون اختراقًا حقيقيًا لا فخًا).", strengths: "دخول قريب جدًا من نقطة الانعكاس الفعلية بمخاطرة محدودة.", weaknesses: "يتشابه كثيرًا مع بداية اختراق حقيقي، ويحتاج تأكيدًا سريعًا قبل الدخول.", winRate: 0.45, avgRR: 2.6 },
 ];
 
+const CURRENCY_COUNTRY_AR = {
+  USD: "الولايات المتحدة", EUR: "منطقة اليورو", GBP: "المملكة المتحدة", JPY: "اليابان",
+  AUD: "أستراليا", CAD: "كندا", CHF: "سويسرا", NZD: "نيوزيلندا", CNY: "الصين", ALL: "عالمي",
+};
+function mapImpact(raw) {
+  const s = (raw || "").toLowerCase();
+  if (s.includes("high")) return "HIGH";
+  if (s.includes("med")) return "MEDIUM";
+  if (s.includes("hol")) return "MEDIUM";
+  return "LOW";
+}
+
 const NEWS_EVENTS = [
   { id: 1, name: "قرار سعر الفائدة - الاحتياطي الفيدرالي (FOMC)", country: "الولايات المتحدة", impact: "HIGH", offsetDays: 2, forecast: "4.00%", previous: "4.25%" },
   { id: 2, name: "مؤشر أسعار المستهلك (CPI)", country: "الولايات المتحدة", impact: "HIGH", offsetDays: -1, forecast: "2.9%", previous: "3.0%", actual: "2.8%" },
@@ -1570,9 +1582,54 @@ function Row({ label, value, color }) {
 /* ============================== الأخبار والتقويم الاقتصادي وتحليل المشاعر ============================== */
 function NewsPage({ overallSentiment }) {
   const today = new Date();
+  const [realNews, setRealNews] = useState(null); // null = لسا ما وصل، [] = وصل فارغ، array = بيانات حقيقية
+  const [newsError, setNewsError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const NEWS_TTL_MS = 60 * 60 * 1000; // ساعة — المصدر العام محدود بشدة (طلبان كل 5 دقائق لكل المستخدمين عالميًا)
+    (async () => {
+      const cached = await loadKey("real-news-cache", null);
+      const now = Date.now();
+      if (cached && cached.ts && now - cached.ts < NEWS_TTL_MS && Array.isArray(cached.events)) {
+        if (!cancelled) setRealNews(cached.events);
+        return;
+      }
+      try {
+        const res = await fetch("/.netlify/functions/news");
+        if (!res.ok) throw new Error("bad response");
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("unexpected shape");
+        const events = data.map((e, i) => ({
+          id: `real-${i}`,
+          name: e.title || "حدث اقتصادي",
+          country: CURRENCY_COUNTRY_AR[e.country] || e.country || "—",
+          impact: mapImpact(e.impact),
+          date: e.date,
+          forecast: e.forecast || "—",
+          previous: e.previous || "—",
+          actual: e.actual || "",
+        }));
+        if (cancelled) return;
+        setRealNews(events);
+        saveKey("real-news-cache", { ts: now, events });
+      } catch (e) {
+        console.warn("فشل جلب التقويم الاقتصادي الحقيقي:", e.message);
+        if (!cancelled) setNewsError(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const usingReal = Array.isArray(realNews) && realNews.length > 0;
+  const displayEvents = usingReal
+    ? [...realNews].sort((a, b) => new Date(a.date) - new Date(b.date))
+    : NEWS_EVENTS;
+
   return (
     <div>
-      <SectionTitle icon={Newspaper} title="الأخبار والتقويم الاقتصادي" subtitle="أحداث اقتصادية نموذجية (محاكاة) مع تفسير الذكاء الاصطناعي" />
+      <SectionTitle icon={Newspaper} title="الأخبار والتقويم الاقتصادي"
+        subtitle={usingReal ? "أحداث حقيقية من التقويم الاقتصادي العام (محدَّثة كل ساعة تقريبًا)" : "لم تصل بعد بيانات حقيقية — يُعرض حاليًا تقويم نموذجي (محاكاة) للتوضيح"} />
       <Panel className="p-4 mb-5">
         <div className="flex items-center justify-between mb-2">
           <div className="text-xs font-bold" style={{ color: C.goldBright }}>معنويات السوق العامة</div>
@@ -1587,11 +1644,16 @@ function NewsPage({ overallSentiment }) {
           </p>
         </div>
       </Panel>
+      {!usingReal && (
+        <div className="rounded-xl p-3 mb-4 text-xs" style={{ background: `${C.gold}0D`, border: `1px solid ${C.gold}33`, color: C.softWhite }}>
+          {newsError ? "تعذر الاتصال بمصدر التقويم الحقيقي حاليًا (قد يكون محدود الطلبات مؤقتًا)، فيُعرض تقويم نموذجي بدلاً منه." : "جاري محاولة جلب التقويم الاقتصادي الحقيقي..."}
+        </div>
+      )}
       <div className="space-y-3">
-        {NEWS_EVENTS.map((n) => {
-          const date = new Date(today); date.setDate(date.getDate() + n.offsetDays);
+        {displayEvents.map((n) => {
+          const date = usingReal ? new Date(n.date) : (() => { const d = new Date(today); d.setDate(d.getDate() + n.offsetDays); return d; })();
           const impactColor = n.impact === "HIGH" ? C.red : n.impact === "MEDIUM" ? C.gold : C.dim;
-          const future = n.offsetDays >= 0;
+          const future = usingReal ? date > today : n.offsetDays >= 0;
           return (
             <Panel key={n.id} className="p-4 flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -1599,9 +1661,9 @@ function NewsPage({ overallSentiment }) {
                 <div className="text-[11px]" style={{ color: C.dim }}>{n.country} · {date.toLocaleDateString("ar-EG")}</div>
               </div>
               <div className="flex items-center gap-4 text-[11px]" style={{ color: C.dim }}>
-                <span>متوقع: <b style={{ color: C.softWhite }} dir="ltr">{n.forecast}</b></span>
-                <span>سابق: <b style={{ color: C.softWhite }} dir="ltr">{n.previous}</b></span>
-                <span>فعلي: <b style={{ color: C.softWhite }} dir="ltr">{future ? "—" : n.actual || "—"}</b></span>
+                <span>متوقع: <b style={{ color: C.softWhite }} dir="ltr">{n.forecast || "—"}</b></span>
+                <span>سابق: <b style={{ color: C.softWhite }} dir="ltr">{n.previous || "—"}</b></span>
+                <span>فعلي: <b style={{ color: C.softWhite }} dir="ltr">{future ? "—" : (n.actual || "—")}</b></span>
               </div>
               <span className="px-2.5 py-1 rounded-full text-[10px] font-bold" style={{ background: `${impactColor}1A`, color: impactColor, border: `1px solid ${impactColor}44` }}>
                 {n.impact === "HIGH" ? "تأثير مرتفع" : n.impact === "MEDIUM" ? "تأثير متوسط" : "تأثير منخفض"}
