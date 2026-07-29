@@ -164,6 +164,7 @@ const TD_HISTORY_SYMBOLS = {
   USDCAD: "USD/CAD",
   NZDUSD: "NZD/USD",
   XAUUSD: "XAU/USD",
+  XAGUSD: "XAG/USD",
 };
 
 // أسعار لحظية من Twelve Data: الفوركس السبعة + الذهب (Finnhub تبيّن أنها لا تدعم هذا مجانًا فعليًا).
@@ -176,9 +177,12 @@ const TD_QUOTE_SYMBOLS = {
   AUDUSD: "AUD/USD",
   USDCAD: "USD/CAD",
   NZDUSD: "NZD/USD",
-  XAUUSD: "XAU/USD",
 };
 const TD_QUOTE_REFRESH_INTERVAL_MS = 900000; // 15 دقيقة — الحد الآمن الحقيقي الوحيد للباقة المجانية
+
+// Gold API (gold-api.com): أسعار حقيقية للذهب والفضة، مجانية بالكامل، بدون مفتاح، بدون حد للطلبات، CORS مفعّل.
+const GOLDAPI_SYMBOLS = { XAUUSD: "XAU", XAGUSD: "XAG" };
+const GOLDAPI_REFRESH_INTERVAL_MS = 30000; // 30 ثانية — لا يوجد حد على هذا المصدر
 
 // Binance: عملات رقمية عبر API عام مجاني بالكامل بدون أي مفتاح، وبدون حد يومي عملي.
 // لهذا الكريبتو يتحدث كل 60 ثانية فعليًا (سرعة أعلى بكثير من الفوركس على الباقة المجانية).
@@ -195,6 +199,7 @@ const CRYPTO_REFRESH_INTERVAL_MS = 60000; // 60 ثانية
 const LIVE_MANAGED_IDS = new Set([
   ...Object.keys(TD_QUOTE_SYMBOLS),
   ...Object.keys(BINANCE_SYMBOLS),
+  ...Object.keys(GOLDAPI_SYMBOLS),
 ]);
 
 const CATEGORIES = [
@@ -2110,6 +2115,44 @@ export default function App() {
     fetchCrypto();
     const t = setInterval(fetchCrypto, CRYPTO_REFRESH_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  // جلب أسعار الذهب والفضة الحقيقية من Gold API (مجاني بالكامل، بدون مفتاح، بدون حد للطلبات، CORS مفعّل)
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchGoldApi() {
+      const nextPrices = {};
+      const nextStatus = {};
+      await Promise.all(Object.entries(GOLDAPI_SYMBOLS).map(async ([id, sym]) => {
+        try {
+          const res = await fetch(`https://api.gold-api.com/price/${sym}`);
+          if (!res.ok) { console.warn("Gold API error:", sym, res.status); return; }
+          const data = await res.json();
+          const price = data.price ?? data.rate ?? data.value ?? data.close;
+          if (price === undefined || price === null) {
+            console.warn("Gold API: unexpected response for", sym, JSON.stringify(data));
+            return;
+          }
+          nextPrices[id] = parseFloat(price);
+          nextStatus[id] = true;
+        } catch (e) {
+          console.warn("Gold API fetch failed:", sym, e.message);
+        }
+      }));
+      if (cancelled || !Object.keys(nextPrices).length) return;
+      setPrices((prev) => ({ ...prev, ...nextPrices }));
+      setLiveStatus((prev) => ({ ...prev, ...nextStatus }));
+      Object.entries(nextPrices).forEach(([id, p]) => recomputeSignalWithLivePrice(id, p));
+      const now = Date.now();
+      setLastUpdated((prev) => {
+        const next = { ...prev };
+        Object.keys(nextPrices).forEach((id) => { next[id] = now; });
+        return next;
+      });
+    }
+    fetchGoldApi();
+    const t2 = setInterval(fetchGoldApi, GOLDAPI_REFRESH_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(t2); };
   }, []);
 
   const changes = useMemo(() => {
