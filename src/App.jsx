@@ -102,6 +102,107 @@ function stdevReturns(arr, n = 20) {
   return Math.sqrt(variance);
 }
 
+function macdLine(closes) {
+  const e12 = ema(closes, 12), e26 = ema(closes, 26);
+  const macd = closes.map((_, i) => e12[i] - e26[i]);
+  const signal = ema(macd, 9);
+  return { macd, signal };
+}
+
+// الاستراتيجيات "الميكانيكية" فقط قابلة للاختبار الآلي الموضوعي (قواعد دخول/خروج واضحة رقميًا).
+// الاستراتيجيات السياقية/النمطية (ICT، SMC، الدعم والمقاومة اليدوي...) تحتاج حكمًا بشريًا ولا يمكن اختبارها آليًا بأمانة.
+const MECHANICAL_STRATEGY_IDS = new Set(["emax", "rsi", "trend", "breakout", "pullback", "macd"]);
+
+// يحسب حالة المركز (1 شراء / -1 بيع / 0 محايد) لكل شمعة حسب قواعد الاستراتيجية المحددة
+function computeStrategyStates(strategyId, closes) {
+  const n = closes.length;
+  const e20 = ema(closes, 20), e50 = ema(closes, 50);
+  const r14 = rsi(closes, 14);
+  const { macd, signal: macdSignal } = macdLine(closes);
+  const rollN = 20;
+  const state = new Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    if (strategyId === "emax") {
+      const crossUp = e20[i - 1] <= e50[i - 1] && e20[i] > e50[i];
+      const crossDown = e20[i - 1] >= e50[i - 1] && e20[i] < e50[i];
+      state[i] = crossUp ? 1 : crossDown ? -1 : state[i - 1];
+    } else if (strategyId === "trend") {
+      if (closes[i] > e50[i] && e20[i] > e50[i]) state[i] = 1;
+      else if (closes[i] < e50[i] && e20[i] < e50[i]) state[i] = -1;
+      else state[i] = 0;
+    } else if (strategyId === "rsi") {
+      if (r14[i - 1] < 30 && r14[i] >= 30) state[i] = 1;
+      else if (r14[i - 1] > 70 && r14[i] <= 70) state[i] = -1;
+      else if (state[i - 1] === 1 && r14[i] >= 60) state[i] = 0;
+      else if (state[i - 1] === -1 && r14[i] <= 40) state[i] = 0;
+      else state[i] = state[i - 1];
+    } else if (strategyId === "breakout") {
+      const from = Math.max(0, i - rollN);
+      const windowHigh = Math.max(...closes.slice(from, i));
+      const windowLow = Math.min(...closes.slice(from, i));
+      state[i] = closes[i] > windowHigh ? 1 : closes[i] < windowLow ? -1 : state[i - 1];
+    } else if (strategyId === "pullback") {
+      const uptrend = closes[i] > e50[i];
+      const downtrend = closes[i] < e50[i];
+      if (uptrend && closes[i - 1] < e20[i - 1] && closes[i] > e20[i]) state[i] = 1;
+      else if (downtrend && closes[i - 1] > e20[i - 1] && closes[i] < e20[i]) state[i] = -1;
+      else state[i] = state[i - 1];
+    } else if (strategyId === "macd") {
+      const crossUp = macd[i - 1] <= macdSignal[i - 1] && macd[i] > macdSignal[i];
+      const crossDown = macd[i - 1] >= macdSignal[i - 1] && macd[i] < macdSignal[i];
+      state[i] = crossUp ? 1 : crossDown ? -1 : state[i - 1];
+    }
+  }
+  return state;
+}
+
+// يحوّل مصفوفة حالات المركز إلى قائمة صفقات فعلية (دخول/خروج) بوحدة R (النتيجة ÷ وحدة مخاطرة واقعية)
+function statesToTrades(state, closes) {
+  const trades = [];
+  let entryIdx = null, dir = 0;
+  function closeTrade(exitIdx) {
+    const entryPrice = closes[entryIdx];
+    const exitPrice = closes[exitIdx];
+    const volSlice = closes.slice(Math.max(0, entryIdx - 14), entryIdx + 1);
+    const localVol = volSlice.length > 2 ? stdevReturns(volSlice, volSlice.length - 1) : 0.005;
+    const riskUnit = Math.max(entryPrice * (localVol || 0.004) * 0.9, entryPrice * 0.0008);
+    const r = ((exitPrice - entryPrice) * dir) / riskUnit;
+    trades.push({ entryIdx, exitIdx, dir, r });
+  }
+  for (let i = 1; i < state.length; i++) {
+    if (state[i] !== state[i - 1]) {
+      if (entryIdx !== null && dir !== 0) closeTrade(i);
+      if (state[i] !== 0) { entryIdx = i; dir = state[i]; } else { entryIdx = null; dir = 0; }
+    }
+  }
+  if (entryIdx !== null && dir !== 0) closeTrade(state.length - 1);
+  return trades;
+}
+
+// المحرك الرئيسي: اختبار خلفي حقيقي فعليًا على بيانات سعرية حقيقية (أو محاكاة إن لم تتوفر حقيقية لهذا الأصل)
+function runRealBacktest(strategyId, closes) {
+  if (!MECHANICAL_STRATEGY_IDS.has(strategyId) || closes.length < 60) return null;
+  const state = computeStrategyStates(strategyId, closes);
+  const trades = statesToTrades(state, closes);
+  if (trades.length === 0) return { trades: [], curve: [{ i: 0, equity: 0 }], stats: null };
+  let equity = 0, peak = 0, maxDD = 0, curWin = 0, curLoss = 0, maxWin = 0, maxLoss = 0;
+  const curve = [{ i: 0, equity: 0 }];
+  trades.forEach((t, idx) => {
+    equity += t.r;
+    peak = Math.max(peak, equity);
+    maxDD = Math.max(maxDD, peak - equity);
+    if (t.r > 0) { curWin++; curLoss = 0; maxWin = Math.max(maxWin, curWin); }
+    else { curLoss++; curWin = 0; maxLoss = Math.max(maxLoss, curLoss); }
+    curve.push({ i: idx + 1, equity: Number(equity.toFixed(2)) });
+  });
+  const wins = trades.filter((t) => t.r > 0);
+  const losses = trades.filter((t) => t.r <= 0);
+  const winRate = (wins.length / trades.length) * 100;
+  const profitFactor = losses.length ? Math.abs(wins.reduce((a, b) => a + b.r, 0) / losses.reduce((a, b) => a + b.r, 0)) : (wins.length ? Infinity : 0);
+  const avgR = equity / trades.length;
+  return { trades, curve, stats: { n: trades.length, winRate, totalR: equity, maxDD, maxWin, maxLoss, avgR, profitFactor } };
+}
+
 // يبني شموع OHLC تقريبية من سلسلة أسعار إغلاق فقط (حقيقية أو محاكاة)، لعرضها ورسم تحليل AI فوقها.
 // يُستخدم أطر زمنية يومية تنازلية من اليوم الحالي لضمان محاور زمنية صحيحة في lightweight-charts.
 function synthesizeOHLC(closes, times) {
@@ -250,7 +351,7 @@ function computeSignal(model) {
   const rsiL = r14[r14.length - 1];
   const volCloses = model.volSeries || closes;
   const realizedVol = stdevReturns(volCloses, 14); // تقلب فعلي مبني على حركة السعر الحقيقية الأخيرة (من إطار زمني واحد ثابت)
-  const atr = last * realizedVol * 1.1;
+  const atr = last * realizedVol * 0.9;
 
   // نقاط فرعية (-1..1)
   const htf = clamp(trueBias, -1, 1);
@@ -284,22 +385,22 @@ function computeSignal(model) {
   // مناطق الدخول ومستويات الصفقة
   let entryLow, entryHigh, sl, tp1, tp2, tp3;
   if (bias === "BUY") {
-    entryHigh = last; entryLow = last - atr * 0.35;
-    sl = entryLow - atr * 1.0;
-    tp1 = last + atr * 1.5; tp2 = last + atr * 2.6; tp3 = last + atr * 4.2;
+    entryHigh = last; entryLow = last - atr * 0.25;
+    sl = entryLow - atr * 0.8;
+    tp1 = last + atr * 1.0; tp2 = last + atr * 1.8; tp3 = last + atr * 2.8;
   } else if (bias === "SELL") {
-    entryLow = last; entryHigh = last + atr * 0.35;
-    sl = entryHigh + atr * 1.0;
-    tp1 = last - atr * 1.5; tp2 = last - atr * 2.6; tp3 = last - atr * 4.2;
+    entryLow = last; entryHigh = last + atr * 0.25;
+    sl = entryHigh + atr * 0.8;
+    tp1 = last - atr * 1.0; tp2 = last - atr * 1.8; tp3 = last - atr * 2.8;
   } else {
-    entryLow = last - atr * 0.2; entryHigh = last + atr * 0.2;
-    sl = null; tp1 = last + atr * 1.5; tp2 = last - atr * 1.5; tp3 = null;
+    entryLow = last - atr * 0.15; entryHigh = last + atr * 0.15;
+    sl = null; tp1 = last + atr * 1.0; tp2 = last - atr * 1.0; tp3 = null;
   }
   const entryMid = (entryLow + entryHigh) / 2;
   const rr = sl ? Math.abs((tp2 - entryMid) / (entryMid - sl)) : null;
 
-  const support = last - atr * 1.6;
-  const resistance = last + atr * 1.6;
+  const support = last - atr * 1.2;
+  const resistance = last + atr * 1.2;
 
   // جدول الأطر الزمنية
   const tfTable = TIMEFRAMES.map((tf) => {
@@ -1478,67 +1579,82 @@ function TinyField({ label, value, onChange, full }) {
 }
 
 /* ============================== الاختبار الخلفي ============================== */
-function Backtest({ models }) {
+function Backtest({ models, signals }) {
   const [strategyId, setStrategyId] = useState(STRATEGIES[0].id);
   const [assetId, setAssetId] = useState(models[0].id);
   const [result, setResult] = useState(null);
+  const [unsupported, setUnsupported] = useState(false);
 
   function run() {
-    const strat = STRATEGIES.find((s) => s.id === strategyId);
-    const rand = mulberry32(hashStr(strategyId + assetId + Date.now()));
-    const n = 50 + Math.floor(rand() * 30);
-    let equity = 0, peak = 0, maxDD = 0, curWin = 0, curLoss = 0, maxWin = 0, maxLoss = 0;
-    const curve = [{ i: 0, equity: 0 }];
-    for (let i = 1; i <= n; i++) {
-      const isWin = rand() < strat.winRate;
-      const r = isWin ? strat.avgRR * (0.6 + rand() * 0.8) : -1 * (0.6 + rand() * 0.6);
-      equity += r;
-      peak = Math.max(peak, equity);
-      maxDD = Math.max(maxDD, peak - equity);
-      if (r > 0) { curWin++; curLoss = 0; maxWin = Math.max(maxWin, curWin); } else { curLoss++; curWin = 0; maxLoss = Math.max(maxLoss, curLoss); }
-      curve.push({ i, equity: Number(equity.toFixed(2)) });
-    }
-    const wins = curve.slice(1).filter((_, idx) => idx >= 0);
-    setResult({ curve, n, winRate: strat.winRate * 100, totalR: equity, maxDD, maxWin, maxLoss, avgR: equity / n });
+    setUnsupported(false);
+    setResult(null);
+    if (!MECHANICAL_STRATEGY_IDS.has(strategyId)) { setUnsupported(true); return; }
+    const model = models.find((m) => m.id === assetId);
+    const signal = signals[assetId];
+    const closes = (signal?.ohlcBars || []).map((b) => b.close);
+    const bt = runRealBacktest(strategyId, closes);
+    if (!bt || !bt.stats) { setUnsupported(true); return; }
+    setResult({ ...bt, isRealData: !!signal.indicatorsReal });
   }
 
   const strat = STRATEGIES.find((s) => s.id === strategyId);
+  const isMechanical = MECHANICAL_STRATEGY_IDS.has(strategyId);
   return (
     <div>
-      <SectionTitle icon={BookOpen} title="الاختبار الخلفي (Backtesting)" subtitle="محاكاة تعليمية لأداء استراتيجية على بيانات افتراضية — ليست بيانات تاريخية حقيقية" />
+      <SectionTitle icon={BookOpen} title="الاختبار الخلفي (Backtesting)" subtitle="اختبار آلي حقيقي: تنفيذ فعلي لقواعد الاستراتيجية شمعة بشمعة على بيانات سعرية فعلية" />
       <Panel className="p-4 mb-5">
         <div className="flex flex-wrap gap-3 items-end">
           <div>
             <label className="block text-xs mb-1" style={{ color: C.dim }}>الاستراتيجية</label>
-            <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)} className="text-xs rounded-lg px-3 py-2"
+            <select value={strategyId} onChange={(e) => { setStrategyId(e.target.value); setResult(null); setUnsupported(false); }} className="text-xs rounded-lg px-3 py-2"
               style={{ background: C.bgDeep, color: C.softWhite, border: `1px solid ${C.border}` }}>
-              {STRATEGIES.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              {STRATEGIES.map((s) => <option key={s.id} value={s.id}>{s.name}{MECHANICAL_STRATEGY_IDS.has(s.id) ? "" : " (غير مدعومة آليًا)"}</option>)}
             </select>
           </div>
           <div>
             <label className="block text-xs mb-1" style={{ color: C.dim }}>الأصل</label>
-            <select value={assetId} onChange={(e) => setAssetId(e.target.value)} className="text-xs rounded-lg px-3 py-2"
+            <select value={assetId} onChange={(e) => { setAssetId(e.target.value); setResult(null); setUnsupported(false); }} className="text-xs rounded-lg px-3 py-2"
               style={{ background: C.bgDeep, color: C.softWhite, border: `1px solid ${C.border}` }}>
               {models.map((m) => <option key={m.id} value={m.id}>{m.nameAr}</option>)}
             </select>
           </div>
           <button onClick={run} className="px-4 py-2 rounded-xl text-sm font-bold" style={{ background: C.gold, color: "#FFFFFF" }}>تشغيل الاختبار</button>
         </div>
+        {!isMechanical && (
+          <p className="text-[11px] mt-2" style={{ color: C.gold }}>
+            ⚠️ هذه استراتيجية سياقية/نمطية (تحتاج حكمًا بصريًا بشريًا) — لا يمكن اختبارها آليًا بموضوعية بالبيانات الحالية. الاختبار الآلي الحقيقي متاح حاليًا لـ: EMA Crossover، RSI Reversal، تتبع الاتجاه، الاختراق، الارتداد، MACD Momentum.
+          </p>
+        )}
       </Panel>
+      {unsupported && isMechanical && (
+        <div className="rounded-xl p-3 mb-4 text-xs" style={{ background: `${C.red}0D`, border: `1px solid ${C.red}33`, color: C.softWhite }}>
+          لا توجد صفقات كافية أو بيانات كافية لهذا الأصل لتشغيل اختبار موثوق.
+        </div>
+      )}
+      {unsupported && !isMechanical && (
+        <div className="rounded-xl p-3 mb-4 text-xs" style={{ background: `${C.gold}0D`, border: `1px solid ${C.gold}33`, color: C.softWhite }}>
+          اختر إحدى الاستراتيجيات الميكانيكية المدعومة أعلاه لتشغيل اختبار حقيقي.
+        </div>
+      )}
       {result && (
         <>
+          <div className="rounded-xl p-3 mb-4 text-xs" style={{ background: `${result.isRealData ? C.green : C.gold}0D`, border: `1px solid ${(result.isRealData ? C.green : C.gold)}33`, color: C.softWhite }}>
+            {result.isRealData
+              ? "✅ هذا الاختبار نُفِّذ فعليًا على بيانات سعرية تاريخية حقيقية لهذا الأصل، بتنفيذ آلي حرفي لقواعد الاستراتيجية شمعة بشمعة."
+              : "⚠️ لا توجد بيانات تاريخية حقيقية لهذا الأصل بعد، فنُفِّذ الاختبار (بنفس المنطق الآلي الحقيقي) على بيانات محاكاة (SIMULATED) بدلاً منها."}
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
-            <PlanStat label="عدد الصفقات" value={result.n} />
-            <PlanStat label="نسبة الفوز الافتراضية" value={`${fmtNum(result.winRate, 1)}%`} color={C.green} />
-            <PlanStat label="العائد الإجمالي (R)" value={fmtNum(result.totalR, 1)} color={result.totalR >= 0 ? C.green : C.red} />
-            <PlanStat label="أقصى تراجع (Drawdown)" value={`${fmtNum(result.maxDD, 1)}R`} color={C.red} />
-            <PlanStat label="متوسط R لكل صفقة" value={fmtNum(result.avgR, 2)} />
-            <PlanStat label="أطول سلسلة أرباح" value={result.maxWin} color={C.green} />
-            <PlanStat label="أطول سلسلة خسائر" value={result.maxLoss} color={C.red} />
-            <PlanStat label="نسبة R:R المفترضة" value={`1:${strat.avgRR}`} color={C.gold} />
+            <PlanStat label="عدد الصفقات الفعلية" value={result.stats.n} />
+            <PlanStat label="نسبة الفوز الفعلية" value={`${fmtNum(result.stats.winRate, 1)}%`} color={C.green} />
+            <PlanStat label="العائد الإجمالي (R)" value={fmtNum(result.stats.totalR, 1)} color={result.stats.totalR >= 0 ? C.green : C.red} />
+            <PlanStat label="أقصى تراجع (Drawdown)" value={`${fmtNum(result.stats.maxDD, 1)}R`} color={C.red} />
+            <PlanStat label="متوسط R لكل صفقة" value={fmtNum(result.stats.avgR, 2)} />
+            <PlanStat label="أطول سلسلة أرباح" value={result.stats.maxWin} color={C.green} />
+            <PlanStat label="أطول سلسلة خسائر" value={result.stats.maxLoss} color={C.red} />
+            <PlanStat label="عامل الربح (Profit Factor)" value={isFinite(result.stats.profitFactor) ? fmtNum(result.stats.profitFactor, 2) : "∞"} color={C.gold} />
           </div>
           <Panel className="p-4">
-            <div className="text-xs font-bold mb-2" style={{ color: C.goldBright }}>منحنى الأداء التراكمي (Equity Curve)</div>
+            <div className="text-xs font-bold mb-2" style={{ color: C.goldBright }}>منحنى الأداء التراكمي الفعلي (Equity Curve)</div>
             <ResponsiveContainer width="100%" height={280}>
               <LineChart data={result.curve}>
                 <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
@@ -1546,7 +1662,7 @@ function Backtest({ models }) {
                 <YAxis tick={{ fill: C.dim, fontSize: 10 }} />
                 <Tooltip contentStyle={{ background: C.bgPanel2, border: `1px solid ${C.border}` }} />
                 <ReferenceLine y={0} stroke={C.dim} />
-                <Line type="monotone" dataKey="equity" stroke={result.totalR >= 0 ? C.green : C.red} strokeWidth={2} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="equity" stroke={result.stats.totalR >= 0 ? C.green : C.red} strokeWidth={2} dot={false} isAnimationActive={false} />
               </LineChart>
             </ResponsiveContainer>
           </Panel>
@@ -2258,7 +2374,7 @@ export default function App() {
           {view === "journal" && (
             <Journal models={models} entries={journalEntries} addEntry={addJournalEntry} deleteEntry={deleteJournalEntry} />
           )}
-          {view === "backtest" && <Backtest models={models} />}
+          {view === "backtest" && <Backtest models={models} signals={signals} />}
           {view === "strategies" && <StrategyLab />}
           {view === "news" && <NewsPage overallSentiment={overallSentiment} />}
           {view === "assistant" && <AIAssistant models={models} signals={signals} prices={prices} />}
