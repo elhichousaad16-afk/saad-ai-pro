@@ -972,13 +972,15 @@ function TimeframeLadder({ tfTable }) {
 }
 
 /* ============================== صفحة تفاصيل الأصل ============================== */
-function AssetDetail({ model, signal, price, changePct, inWatchlist, toggleWatch, goToPlan, live, lastUpdated }) {
+function AssetDetail({ model, signal, price, changePct, inWatchlist, toggleWatch, goToPlan, live, lastUpdated, alerts, addAlert, deleteAlert }) {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [aiDecision, setAiDecision] = useState(null); // "BUY" | "SELL" | "WAIT"
   const [aiPlan, setAiPlan] = useState(null); // {decision, confidence, entry_low, entry_high, sl, tp1, tp2, tp3, rr}
   const [aiError, setAiError] = useState(null);
   const [nowTick, setNowTick] = useState(Date.now());
+  const [showAlertForm, setShowAlertForm] = useState(false);
+  const [alertPrice, setAlertPrice] = useState("");
 
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 1000);
@@ -1147,12 +1149,51 @@ ${stratLines}
             style={{ border: `1px solid ${C.border}`, color: inWatchlist ? C.gold : C.dim }}>
             <Star size={14} fill={inWatchlist ? C.gold : "none"} /> {inWatchlist ? "في المراقبة" : "أضف للمراقبة"}
           </button>
+          <div className="relative">
+            <button onClick={() => setShowAlertForm((v) => !v)} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold"
+              style={{ border: `1px solid ${C.border}`, color: C.dim }}>
+              🔔 تنبيه سعري
+            </button>
+            {showAlertForm && (
+              <div className="absolute top-full mt-2 left-0 z-30 w-64 rounded-xl p-3 text-xs shadow-lg" style={{ background: C.bgPanel, border: `1px solid ${C.border}` }}>
+                <label className="block mb-1" style={{ color: C.dim }}>نبّهني عندما يصل السعر إلى:</label>
+                <input type="number" value={alertPrice} onChange={(e) => setAlertPrice(e.target.value)} dir="ltr"
+                  placeholder={fmtNum(price, model.decimals)}
+                  className="w-full mb-2 rounded-lg px-2 py-1.5" style={{ background: C.bgDeep, color: C.softWhite, border: `1px solid ${C.border}`, fontFamily: FONT_MONO }} />
+                <button
+                  onClick={() => {
+                    const target = parseFloat(alertPrice);
+                    if (!target) return;
+                    addAlert(model.id, target, target >= price ? "above" : "below");
+                    setAlertPrice(""); setShowAlertForm(false);
+                  }}
+                  className="w-full py-1.5 rounded-lg font-bold" style={{ background: C.gold, color: "#FFFFFF" }}>
+                  إنشاء التنبيه
+                </button>
+                {typeof Notification !== "undefined" && Notification.permission === "denied" && (
+                  <p className="mt-2" style={{ color: C.red }}>الإشعارات محظورة من إعدادات المتصفح — فعّلها لتصلك التنبيهات.</p>
+                )}
+              </div>
+            )}
+          </div>
           <button onClick={goToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold"
             style={{ background: C.gold, color: "#FFFFFF" }}>
             <Calculator size={14} /> حاسبة المخاطر
           </button>
         </div>
       </div>
+
+      {alerts && alerts.filter((a) => a.assetId === model.id).length > 0 && (
+        <div className="flex flex-wrap gap-2 mb-4">
+          {alerts.filter((a) => a.assetId === model.id).map((a) => (
+            <span key={a.id} className="flex items-center gap-2 text-[11px] px-3 py-1.5 rounded-full"
+              style={{ background: a.triggered ? `${C.dim}14` : `${C.gold}1A`, color: a.triggered ? C.dim : C.gold, border: `1px solid ${a.triggered ? C.border : C.gold + "44"}` }}>
+              🔔 {a.direction === "above" ? "≥" : "≤"} {fmtNum(a.targetPrice, model.decimals)} {a.triggered && "(تحقق)"}
+              <button onClick={() => deleteAlert(a.id)}><Trash2 size={11} /></button>
+            </span>
+          ))}
+        </div>
+      )}
 
       <Panel className="p-4 mb-5">
         <div className="flex items-center justify-between mb-2">
@@ -1342,19 +1383,44 @@ function ScenarioCard({ title, color, rows }) {
 }
 
 /* ============================== الماسح الذكي ============================== */
-function Scanner({ models, signals, prices, sortBy, setSortBy, filterBias, setFilterBias, openAsset }) {
+function Scanner({ models, signals, prices, sortBy, setSortBy, filterBias, setFilterBias, openAsset, strategyFilter, clearStrategyFilter }) {
+  const [category, setCategory] = useState("all");
+  const [minConfidence, setMinConfidence] = useState(0);
+  const [volFilter, setVolFilter] = useState("ALL");
+
+  function volLevel(volPct) { return volPct > 0.011 ? "HIGH" : volPct > 0.007 ? "MEDIUM" : "LOW"; }
+
   let rows = models.map((m) => ({ m, s: signals[m.id], p: prices[m.id] }));
   if (filterBias !== "ALL") rows = rows.filter((r) => r.s.bias === filterBias);
+  if (category !== "all") rows = rows.filter((r) => r.m.category === category);
+  if (minConfidence > 0) rows = rows.filter((r) => r.s.confidence >= minConfidence);
+  if (volFilter !== "ALL") rows = rows.filter((r) => volLevel(r.m.volPct) === volFilter);
+  if (strategyFilter && MECHANICAL_STRATEGY_IDS.has(strategyFilter)) {
+    rows = rows.filter((r) => {
+      const closes = (r.s.ohlcBars || []).map((b) => b.close);
+      if (closes.length < 60) return false;
+      const state = computeStrategyStates(strategyFilter, closes);
+      return state[state.length - 1] !== 0;
+    });
+  }
   rows.sort((a, b) => {
     if (sortBy === "confidence") return b.s.confidence - a.s.confidence;
     if (sortBy === "rr") return (b.s.rr || 0) - (a.s.rr || 0);
     if (sortBy === "volatility") return b.m.volPct - a.m.volPct;
     return 0;
   });
+  const strat = strategyFilter ? STRATEGIES.find((s) => s.id === strategyFilter) : null;
+
   return (
     <div>
-      <SectionTitle icon={Search} title="AI MARKET OPPORTUNITIES — الماسح الذكي للفرص" subtitle="ترتيب جميع الأصول وفق قوة إشارة الذكاء الاصطناعي" />
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <SectionTitle icon={Search} title="AI MARKET OPPORTUNITIES — الماسح الذكي للفرص" subtitle="فلترة وترتيب حقيقيان لكل الأصول حسب معايير قابلة للتخصيص" />
+      {strat && (
+        <div className="flex items-center justify-between rounded-xl p-3 mb-4 text-xs" style={{ background: `${C.cyan}0D`, border: `1px solid ${C.cyan}33`, color: C.softWhite }}>
+          <span>🎯 يعرض فقط الأصول المطابقة الآن لاستراتيجية <b style={{ color: C.cyan }}>{strat.name}</b></span>
+          <button onClick={clearStrategyFilter} className="px-2 py-1 rounded-lg font-semibold" style={{ border: `1px solid ${C.border}`, color: C.dim }}>إلغاء الفلتر</button>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-3 mb-4">
         <div className="flex gap-2">
           {["ALL", "BUY", "SELL", "WAIT"].map((f) => (
             <button key={f} onClick={() => setFilterBias(f)} className="px-3 py-1.5 rounded-full text-xs font-semibold"
@@ -1363,6 +1429,21 @@ function Scanner({ models, signals, prices, sortBy, setSortBy, filterBias, setFi
             </button>
           ))}
         </div>
+        <select value={category} onChange={(e) => setCategory(e.target.value)} className="text-xs rounded-lg px-3 py-2"
+          style={{ background: C.bgPanel2, color: C.softWhite, border: `1px solid ${C.border}` }}>
+          {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+        </select>
+        <select value={volFilter} onChange={(e) => setVolFilter(e.target.value)} className="text-xs rounded-lg px-3 py-2"
+          style={{ background: C.bgPanel2, color: C.softWhite, border: `1px solid ${C.border}` }}>
+          <option value="ALL">كل مستويات التقلب</option>
+          <option value="LOW">تقلب منخفض فقط</option>
+          <option value="MEDIUM">تقلب متوسط فقط</option>
+          <option value="HIGH">تقلب مرتفع فقط</option>
+        </select>
+        <div className="flex items-center gap-2 text-xs" style={{ color: C.dim }}>
+          <span>أدنى ثقة: <b style={{ color: C.gold }}>{minConfidence}%</b></span>
+          <input type="range" min="0" max="90" step="5" value={minConfidence} onChange={(e) => setMinConfidence(Number(e.target.value))} />
+        </div>
         <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="text-xs rounded-lg px-3 py-2"
           style={{ background: C.bgPanel2, color: C.softWhite, border: `1px solid ${C.border}` }}>
           <option value="confidence">ترتيب حسب الثقة</option>
@@ -1370,6 +1451,9 @@ function Scanner({ models, signals, prices, sortBy, setSortBy, filterBias, setFi
           <option value="volatility">ترتيب حسب التقلب</option>
         </select>
       </div>
+      {rows.length === 0 && (
+        <Panel className="p-8 text-center text-xs" style={{ color: C.dim }}>لا توجد أصول مطابقة لهذه الفلاتر حاليًا.</Panel>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
         {rows.map(({ m, s, p }) => (
           <Panel key={m.id} className="p-4 cursor-pointer hover:brightness-110" onClick={() => openAsset(m.id)}>
@@ -1438,6 +1522,18 @@ function TradePlan({ models, signals, prices, selectedAssetId, setSelectedAssetI
   const potentialProfit = positionSize * Math.abs(tp - entry);
   const rr = slDistance > 0 ? Math.abs(tp - entry) / slDistance : 0;
 
+  // أحجام العقد القياسية الشائعة لدى الوسطاء (تقريبية — تحقق دائمًا من مواصفات وسيطك الفعلي)
+  const CONTRACT_SIZE = {
+    forex: 100000, // 1 لوت فوركس قياسي = 100,000 وحدة من العملة الأساس
+    metals: model.id === "XAGUSD" ? 5000 : 100, // الفضة عادة 5000 أونصة/لوت، الذهب 100 أونصة/لوت
+    crypto: 1,
+    indices: 1,
+    commodities: 1000,
+  };
+  const contractSize = CONTRACT_SIZE[model.category] || 1;
+  const lots = positionSize / contractSize;
+  const lotsLabel = model.category === "forex" ? "لوت قياسي (100,000 وحدة)" : model.category === "metals" ? `لوت (${contractSize} أونصة)` : "عقد/وحدة";
+
   return (
     <div>
       <SectionTitle icon={Calculator} title="خطة التداول وحاسبة إدارة المخاطر" subtitle="أدخل بيانات حسابك لحساب حجم الصفقة المناسب" />
@@ -1459,6 +1555,7 @@ function TradePlan({ models, signals, prices, selectedAssetId, setSelectedAssetI
           <div className="text-xs font-bold mb-4" style={{ color: C.goldBright }}>نتائج الحساب</div>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
             <PlanStat label="حجم الصفقة المقترح (وحدات)" value={fmtNum(positionSize, 2)} color={C.cyan} />
+            <PlanStat label={`حجم الصفقة الفعلي (${lotsLabel})`} value={fmtNum(lots, 3)} color={C.cyan} />
             <PlanStat label="أقصى خسارة محتملة" value={`$${fmtNum(riskAmount, 2)}`} color={C.red} />
             <PlanStat label="الربح المحتمل عند الهدف" value={`$${fmtNum(potentialProfit, 2)}`} color={C.green} />
             <PlanStat label="نسبة المخاطرة إلى العائد" value={`1:${fmtNum(rr, 2)}`} color={C.gold} />
@@ -1514,6 +1611,25 @@ function Journal({ models, entries, addEntry, deleteEntry }) {
           <PlanStat label="متوسط R" value={fmtNum(stats.avgR, 2)} color={stats.avgR >= 0 ? C.green : C.red} />
           <PlanStat label="عامل الربح" value={isFinite(stats.profitFactor) ? fmtNum(stats.profitFactor, 2) : "∞"} color={C.gold} />
         </div>
+      )}
+      {stats && stats.total >= 2 && (
+        <Panel className="p-4 mb-5">
+          <div className="text-xs font-bold mb-2" style={{ color: C.goldBright }}>منحنى الأداء التراكمي الفعلي (من صفقاتك الحقيقية)</div>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={(() => {
+              const sorted = [...entries].sort((a, b) => new Date(a.date) - new Date(b.date));
+              let cum = 0;
+              return [{ i: 0, equity: 0 }, ...sorted.map((e, i) => { cum += parseFloat(e.r) || 0; return { i: i + 1, equity: Number(cum.toFixed(2)) }; })];
+            })()}>
+              <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
+              <XAxis dataKey="i" tick={{ fill: C.dim, fontSize: 10 }} />
+              <YAxis tick={{ fill: C.dim, fontSize: 10 }} />
+              <Tooltip contentStyle={{ background: C.bgPanel2, border: `1px solid ${C.border}` }} />
+              <ReferenceLine y={0} stroke={C.dim} />
+              <Line type="monotone" dataKey="equity" stroke={stats.avgR >= 0 ? C.green : C.red} strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </Panel>
       )}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <Panel className="p-4 lg:col-span-1">
@@ -1673,18 +1789,31 @@ function Backtest({ models, signals }) {
 }
 
 /* ============================== مختبر الاستراتيجيات ============================== */
-function StrategyLab() {
+function StrategyLab({ onShowMatches }) {
   return (
     <div>
       <SectionTitle icon={FlaskConical} title="مختبر الاستراتيجيات" subtitle="استراتيجيات قابلة للتخصيص مع شرح متى تُستخدم ومتى لا" />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {STRATEGIES.map((s) => (
           <Panel key={s.id} className="p-4">
-            <div className="font-bold text-sm mb-2" style={{ color: C.softWhite }}>{s.name}</div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-bold text-sm" style={{ color: C.softWhite }}>{s.name}</div>
+              {MECHANICAL_STRATEGY_IDS.has(s.id) && (
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded" style={{ color: C.green, background: `${C.green}1A`, border: `1px solid ${C.green}44` }}>
+                  قابلة للاختبار الآلي
+                </span>
+              )}
+            </div>
             <Row label="متى تُستخدم؟" value={s.when} />
             <Row label="متى لا تُستخدم؟" value={s.whenNot} />
             <Row label="نقاط القوة" value={s.strengths} color={C.green} />
             <Row label="نقاط الضعف" value={s.weaknesses} color={C.red} />
+            {MECHANICAL_STRATEGY_IDS.has(s.id) && (
+              <button onClick={() => onShowMatches(s.id)} className="w-full mt-2 py-2 rounded-lg text-xs font-bold"
+                style={{ background: `${C.cyan}1A`, color: C.cyan, border: `1px solid ${C.cyan}44` }}>
+                🎯 اعرض الأصول المطابقة الآن
+              </button>
+            )}
           </Panel>
         ))}
       </div>
@@ -2320,6 +2449,8 @@ export default function App() {
   const [watchlist, setWatchlist] = useState([]);
   const [journalEntries, setJournalEntries] = useState([]);
   const [settings, setSettings] = useState({ defaultRisk: 1 });
+  const [alerts, setAlerts] = useState([]); // {id, assetId, targetPrice, direction: 'above'|'below', triggered}
+  const [scannerStrategyFilter, setScannerStrategyFilter] = useState(null);
   const loadedRef = useRef(false);
 
   useEffect(() => {
@@ -2327,13 +2458,49 @@ export default function App() {
       const wl = await loadKey("watchlist", ["XAUUSD", "BTCUSD"]);
       const je = await loadKey("journal-entries", []);
       const st = await loadKey("settings", { defaultRisk: 1 });
-      setWatchlist(wl); setJournalEntries(je); setSettings(st);
+      const al = await loadKey("price-alerts", []);
+      setWatchlist(wl); setJournalEntries(je); setSettings(st); setAlerts(al);
       loadedRef.current = true;
     })();
   }, []);
   useEffect(() => { if (loadedRef.current) saveKey("watchlist", watchlist); }, [watchlist]);
   useEffect(() => { if (loadedRef.current) saveKey("journal-entries", journalEntries); }, [journalEntries]);
   useEffect(() => { if (loadedRef.current) saveKey("settings", settings); }, [settings]);
+  useEffect(() => { if (loadedRef.current) saveKey("price-alerts", alerts); }, [alerts]);
+
+  function addAlert(assetId, targetPrice, direction) {
+    setAlerts((prev) => [...prev, { id: Date.now(), assetId, targetPrice, direction, triggered: false }]);
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }
+  function deleteAlert(id) {
+    setAlerts((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  // فحص التنبيهات السعرية الحقيقية عند كل تحديث سعر، وإطلاق إشعار متصفح فعلي عند تحقق الشرط
+  useEffect(() => {
+    if (!loadedRef.current || alerts.length === 0) return;
+    let changed = false;
+    const nextAlerts = alerts.map((a) => {
+      if (a.triggered) return a;
+      const p = prices[a.assetId];
+      if (p === undefined) return a;
+      const hit = a.direction === "above" ? p >= a.targetPrice : p <= a.targetPrice;
+      if (hit) {
+        changed = true;
+        const model = models.find((m) => m.id === a.assetId);
+        const title = `${model ? model.nameAr : a.assetId}: وصل السعر للهدف`;
+        const body = `السعر الحالي ${fmtNum(p, model ? model.decimals : 4)} ${a.direction === "above" ? "تجاوز" : "هبط دون"} ${fmtNum(a.targetPrice, model ? model.decimals : 4)}`;
+        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+          try { new Notification(title, { body }); } catch (e) { /* تجاهل */ }
+        }
+        return { ...a, triggered: true };
+      }
+      return a;
+    });
+    if (changed) setAlerts(nextAlerts);
+  }, [prices, alerts, models]);
 
   function toggleWatch(id) {
     setWatchlist((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
@@ -2359,11 +2526,13 @@ export default function App() {
           {view === "asset" && (
             <AssetDetail model={selectedModel} signal={signals[selectedModel.id]} price={prices[selectedModel.id]} changePct={changes[selectedModel.id]}
               inWatchlist={watchlist.includes(selectedModel.id)} toggleWatch={() => toggleWatch(selectedModel.id)}
-              goToPlan={() => setView("tradeplan")} live={liveStatus[selectedModel.id]} lastUpdated={lastUpdated[selectedModel.id]} />
+              goToPlan={() => setView("tradeplan")} live={liveStatus[selectedModel.id]} lastUpdated={lastUpdated[selectedModel.id]}
+              alerts={alerts} addAlert={addAlert} deleteAlert={deleteAlert} />
           )}
           {view === "scanner" && (
             <Scanner models={models} signals={signals} prices={prices} sortBy={scannerSort} setSortBy={setScannerSort}
-              filterBias={scannerFilter} setFilterBias={setScannerFilter} openAsset={openAsset} />
+              filterBias={scannerFilter} setFilterBias={setScannerFilter} openAsset={openAsset}
+              strategyFilter={scannerStrategyFilter} clearStrategyFilter={() => setScannerStrategyFilter(null)} />
           )}
           {view === "watchlist" && (
             <Watchlist models={models} signals={signals} prices={prices} changes={changes} watchlist={watchlist} toggleWatch={toggleWatch} openAsset={openAsset} liveStatus={liveStatus} />
@@ -2375,7 +2544,7 @@ export default function App() {
             <Journal models={models} entries={journalEntries} addEntry={addJournalEntry} deleteEntry={deleteJournalEntry} />
           )}
           {view === "backtest" && <Backtest models={models} signals={signals} />}
-          {view === "strategies" && <StrategyLab />}
+          {view === "strategies" && <StrategyLab onShowMatches={(id) => { setScannerStrategyFilter(id); setView("scanner"); }} />}
           {view === "news" && <NewsPage overallSentiment={overallSentiment} />}
           {view === "assistant" && <AIAssistant models={models} signals={signals} prices={prices} />}
           {view === "settings" && <Settings settings={settings} setSettings={setSettings} resetData={resetData} />}
